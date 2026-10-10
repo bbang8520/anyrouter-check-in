@@ -1,7 +1,8 @@
 name: AnyRouter 自动签到
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    # UTC 02:00 = 北京时间 10:00，每天一次
+    - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       debug:
@@ -13,6 +14,7 @@ on:
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: production
     env:
       PYTHONIOENCODING: utf-8
@@ -47,7 +49,7 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
-          fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf
+        fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf
 
     - name: 缓存 CloakBrowser 二进制
       uses: actions/cache@v5
@@ -88,8 +90,50 @@ jobs:
         PROXY_REQUIRED: false
       run: bash scripts/setup_mihomo_proxy.sh
 
-    - name: 执行签到
+    # 首次签到：单次执行，失败不算任务失败，留给重试判断
+    - name: 签到（第 1 次）
+      id: attempt1
+      continue-on-error: true
       env:
+        DEBUG_MODE: ${{ env.DEBUG_MODE }}
+        CHECKIN_HEADLESS: false
+        CHECKIN_HUMANIZE: true
+        CHECKIN_WAIT_TIMEOUT_MS: 120000
+        ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
+        PROVIDERS: ${{ secrets.PROVIDERS }}
+        DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
+        EMAIL_USER: ${{ secrets.EMAIL_USER }}
+        EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+        CUSTOM_SMTP_SERVER: ${{ secrets.CUSTOM_SMTP_SERVER }}
+        PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        SERVERPUSHKEY: ${{ secrets.SERVERPUSHKEY }}
+        FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        WEIXIN_WEBHOOK: ${{ secrets.WEIXIN_WEBHOOK }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
+        GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+        GOTIFY_PRIORITY: ${{ secrets.GOTIFY_PRIORITY }}
+        BARK_KEY: ${{ secrets.BARK_KEY }}
+        BARK_SERVER: ${{ secrets.BARK_SERVER }}
+      run: |
+        xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run checkin.py
+
+    # 首次失败才重试，等待 5 分钟避开瞬时抖动
+    - name: 等待 5 分钟后重试
+      if: steps.attempt1.outcome == 'failure'
+      run: |
+        echo "⚠️ 第 1 次签到未全部成功，5 分钟后重试一次"
+        sleep 300
+
+    - name: 签到（第 2 次·重试）
+      id: attempt2
+      if: steps.attempt1.outcome == 'failure'
+      continue-on-error: true
+      env:
+        SKIP_SUCCESS_ACCOUNTS: 'true'
         DEBUG_MODE: ${{ env.DEBUG_MODE }}
         CHECKIN_HEADLESS: false
         CHECKIN_HUMANIZE: true
@@ -133,6 +177,7 @@ jobs:
       if: always()
       run: bash scripts/stop_mihomo_proxy.sh
 
+    # 两次都失败才判定任务失败；只重试能省一次浏览器启动的耗时
     - name: 执行结果
       if: always()
       run: |
@@ -142,3 +187,16 @@ jobs:
           echo "调试截图已上传为 artifact: checkin-screenshots-${{ github.run_id }}"
           ls -la checkin_screenshots/
         fi
+
+    - name: 标记最终结果
+      if: always()
+      env:
+        ATTEMPT1: ${{ steps.attempt1.outcome }}
+        ATTEMPT2: ${{ steps.attempt2.outcome }}
+      run: |
+        echo "第1次=$ATTEMPT1 第2次=$ATTEMPT2"
+        if [ "$ATTEMPT1" = "failure" ] && [ "$ATTEMPT2" = "failure" ]; then
+          echo "❌ 两次签到均未完全成功"
+          exit 1
+        fi
+        echo "✅ 至少一次签到成功"
