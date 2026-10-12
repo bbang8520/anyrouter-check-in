@@ -1,8 +1,9 @@
 name: AnyRouter 自动签到
 on:
   schedule:
-    # UTC 02:00 = 北京时间 10:00，每天一次
-    - cron: '0 2 * * *'
+    # 北京时间 10:17，每天一次（避开整点调度高峰）
+    - cron: '17 10 * * *'
+      timezone: 'Asia/Shanghai'
   workflow_dispatch:
     inputs:
       debug:
