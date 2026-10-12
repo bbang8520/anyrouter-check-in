@@ -43,24 +43,48 @@ load_dotenv()
 BALANCE_HASH_FILE = 'balance_hash.txt'
 
 
-def load_balance_hash():
-	"""加载余额hash"""
+def load_balance_cache():
+	"""加载上一次余额缓存，兼容旧版纯 hash 格式"""
 	try:
 		if os.path.exists(BALANCE_HASH_FILE):
 			with open(BALANCE_HASH_FILE, 'r', encoding='utf-8') as f:
-				return f.read().strip()
+				content = f.read().strip()
+
+			if not content:
+				return None, {}
+
+			try:
+				data = json.loads(content)
+				if isinstance(data, dict):
+					return data.get('hash'), data.get('balances', {})
+			except json.JSONDecodeError:
+				pass
+
+			# 兼容旧格式：文件内容只有 hash
+			return content, {}
 	except Exception:  # nosec B110
 		pass
-	return None
+
+	return None, {}
 
 
-def save_balance_hash(balance_hash):
-	"""保存余额hash"""
+def save_balance_cache(balance_hash, balances):
+	"""保存余额 hash 和各账号余额快照"""
 	try:
+		data = {
+			'hash': balance_hash,
+			'balances': balances,
+		}
 		with open(BALANCE_HASH_FILE, 'w', encoding='utf-8') as f:
-			f.write(balance_hash)
+			json.dump(
+				data,
+				f,
+				ensure_ascii=False,
+				sort_keys=True,
+				separators=(',', ':'),
+			)
 	except Exception as e:
-		print(f'Warning: Failed to save balance hash: {e}')
+		print(f'Warning: Failed to save balance cache: {e}')
 
 
 def generate_balance_hash(balances):
@@ -317,14 +341,61 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 
 def format_check_in_notification(detail: dict) -> str:
 	"""格式化签到通知消息"""
+	auto_check_in = detail.get('auto_check_in', False)
+	baseline_source = detail.get('baseline_source', 'same_run')
+
 	lines = [
 		f'[CHECK-IN] {detail["name"]}',
 		'  ━━━━━━━━━━━━━━━━━━━━',
-		'  签到前',
-		f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
-		'  签到后',
-		f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
 	]
+
+	# AgentRouter 等：查询用户信息时会自动触发签到
+	if auto_check_in:
+		if baseline_source == 'previous_run':
+			lines.extend(
+				[
+					'  上次记录',
+					f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
+					'  本次签到后',
+					f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
+					'  ━━━━━━━━━━━━━━━━━━━━',
+				]
+			)
+
+			if detail['check_in_reward'] > 0:
+				lines.append('  自动签到成功')
+				lines.append(f'  签到获得: +${detail["check_in_reward"]:.2f}')
+			else:
+				lines.append('  自动签到已触发，本次未检测到新增奖励')
+
+			if detail['usage_increase'] > 0:
+				lines.append(f'  期间消耗: ${detail["usage_increase"]:.2f}')
+
+			if detail['balance_change'] != 0:
+				change_symbol = '+' if detail['balance_change'] > 0 else ''
+				lines.append(f'  余额变化: {change_symbol}${detail["balance_change"]:.2f}')
+		else:
+			lines.extend(
+				[
+					'  当前状态',
+					f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
+					'  ━━━━━━━━━━━━━━━━━━━━',
+					'  自动签到已触发',
+					'  首次记录，暂无上次余额基线，暂时无法计算本次奖励',
+				]
+			)
+
+		return '\n'.join(lines)
+
+	# AnyRouter 等：有独立签到接口，继续使用本次签到前/后的数据
+	lines.extend(
+		[
+			'  签到前',
+			f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
+			'  签到后',
+			f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
+		]
+	)
 
 	has_reward = detail['check_in_reward'] != 0
 	has_usage = detail['usage_increase'] != 0
@@ -348,7 +419,6 @@ def format_check_in_notification(detail: dict) -> str:
 		lines.extend(['  ━━━━━━━━━━━━━━━━━━━━', '  今日已签到，无变化'])
 
 	return '\n'.join(lines)
-
 
 async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
 	"""为单个账号执行签到操作"""
@@ -503,7 +573,7 @@ async def main():
 
 	print(f'[INFO] Found {len(accounts)} account configurations')
 
-	last_balance_hash = load_balance_hash()
+	last_balance_hash, previous_balances = load_balance_cache()
 
 	success_count = 0
 	total_count = len(accounts)
@@ -533,30 +603,55 @@ async def main():
 				current_used = user_info_after['used_quota']
 				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
 
-				if user_info_before and user_info_before.get('success'):
+				provider_config = app_config.get_provider(account.provider)
+				is_auto_check_in = bool(
+					provider_config
+					and not provider_config.needs_manual_check_in()
+				)
+
+				after_quota = user_info_after['quota']
+				after_used = user_info_after['used_quota']
+				baseline_source = 'same_run'
+
+				# 自动签到型 provider：第一次 user info 请求本身就可能完成签到，
+				# 因此不能拿同一次运行中的 user_info_before 当真正的签到前余额。
+				if is_auto_check_in:
+					previous = previous_balances.get(account_key)
+					if previous:
+						before_quota = previous.get('quota', after_quota)
+						before_used = previous.get('used', after_used)
+						baseline_source = 'previous_run'
+					else:
+						before_quota = after_quota
+						before_used = after_used
+						baseline_source = 'first_run'
+				elif user_info_before and user_info_before.get('success'):
 					before_quota = user_info_before['quota']
 					before_used = user_info_before['used_quota']
-					after_quota = user_info_after['quota']
-					after_used = user_info_after['used_quota']
+				else:
+					before_quota = after_quota
+					before_used = after_used
 
-					total_before = before_quota + before_used
-					total_after = after_quota + after_used
+				total_before = before_quota + before_used
+				total_after = after_quota + after_used
 
-					check_in_reward = total_after - total_before
-					usage_increase = after_used - before_used
-					balance_change = after_quota - before_quota
+				check_in_reward = round(total_after - total_before, 2)
+				usage_increase = round(after_used - before_used, 2)
+				balance_change = round(after_quota - before_quota, 2)
 
-					account_check_in_details[account_key] = {
-						'name': account.get_display_name(i),
-						'before_quota': before_quota,
-						'before_used': before_used,
-						'after_quota': after_quota,
-						'after_used': after_used,
-						'check_in_reward': check_in_reward,
-						'usage_increase': usage_increase,
-						'balance_change': balance_change,
-						'success': success,
-					}
+				account_check_in_details[account_key] = {
+					'name': account.get_display_name(i),
+					'before_quota': before_quota,
+					'before_used': before_used,
+					'after_quota': after_quota,
+					'after_used': after_used,
+					'check_in_reward': check_in_reward,
+					'usage_increase': usage_increase,
+					'balance_change': balance_change,
+					'success': success,
+					'auto_check_in': is_auto_check_in,
+					'baseline_source': baseline_source,
+				}
 
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)
@@ -598,7 +693,7 @@ async def main():
 					notification_content.append(account_result)
 
 	if current_balance_hash:
-		save_balance_hash(current_balance_hash)
+		save_balance_cache(current_balance_hash, current_balances)
 
 	if need_notify and notification_content:
 		summary = [
