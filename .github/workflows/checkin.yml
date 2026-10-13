@@ -1,9 +1,7 @@
 name: AnyRouter 自动签到
+# 通过唯一标识区分 uniCloud 定时启动和手动启动，防止 10:30 巡检误判。
+run-name: "AnyRouter 自动签到 | ${{ inputs.trigger_id || 'manual' }}"
 on:
-  schedule:
-    # 北京时间 10:17，每天一次（避开整点调度高峰）
-    - cron: '17 10 * * *'
-      timezone: 'Asia/Shanghai'
   workflow_dispatch:
     inputs:
       debug:
@@ -11,6 +9,11 @@ on:
         required: false
         default: false
         type: boolean
+      trigger_id:
+        description: uniCloud 当天自动签到标识，供 10:30 巡检识别
+        required: false
+        default: ''
+        type: string
 
 jobs:
   checkin:
